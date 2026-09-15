@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ============================================================================
-#  ELMINYAWE Solver  v3.3.0  —  Single-Container Edition
+#  ELMINYAWE Solver  v3.4.0  —  Single-Container Edition
 # ----------------------------------------------------------------------------
 #  Cloudflare Turnstile solving behind the ELMINYAWE API.
 #  Engine: Theyka/Turnstile-Solver algorithm (patchright + Turnstile widget),
@@ -8,6 +8,17 @@
 #
 #  ONE image, ONE container, ALL code embedded in this file (heredocs).
 #  Fully white-labeled: the API speaks ELMINYAWE only.
+#
+#  PORTS ARCHITECTURE (v3.4.0) — one service, zero port conflicts:
+#    - The API gateway is the ONLY public listener: port 8191 (ELMINYAWE_PORT).
+#    - The solving worker is fully internal: in-process Chromium driven over
+#      a private pipe (no TCP port at all) on the internal Xvfb display :99.
+#      Nothing inside the container serves the worker to the network.
+#    - Platform port compatibility: if the host platform (e.g. Railway)
+#      injects its own PORT (say 8080), the SAME API also binds that port.
+#      One process, one app, two sockets -> public entry stays 8191, and
+#      the platform may target either port. A port-mismatch 502 becomes
+#      impossible by construction.
 #
 #  STEALTH POSTURE (v3.3.0, mirrors the proven reference Docker recipe):
 #    - headed browser on a virtual display (Xvfb) by default - not headless
@@ -17,6 +28,9 @@
 #
 #  BUILD : docker build -t elminyawe-solver .
 #  RUN   : docker run -d -p 8191:8191 --shm-size=256m elminyawe-solver
+#
+#  RAILWAY: one service only. Target Port = 8191 (or leave 8080 — both
+#  work, see PORTS ARCHITECTURE above). Delete duplicate services.
 #
 #  QUICK USE :
 #    POST /v1     {"url": "https://site.com/page", "sitekey": "0x4AAA..."}
@@ -39,7 +53,9 @@
 #    GET  /tasks                          -> tracked tasks overview
 #
 #  ENV CONFIG (all optional):
-#    PORT=8191                 API port
+#    ELMINYAWE_PORT=8191       primary public API port (the single entry)
+#    PORT=<platform port>      platform-injected compat port; when set and
+#                              different, the same API binds it as an alias
 #    HOST=0.0.0.0              bind address
 #    LOG_LEVEL=info            info | debug | warning | error
 #    MAX_CONCURRENT_SOLVES=2   simultaneous browser sessions (RAM guard)
@@ -66,7 +82,8 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DEBIAN_FRONTEND=noninteractive \
     HOST=0.0.0.0 \
-    PORT=8191 \
+    ELMINYAWE_PORT=8191 \
+    PORT="" \
     LOG_LEVEL=info \
     MAX_CONCURRENT_SOLVES=2 \
     WORKER_WAIT_TIMEOUT=5 \
@@ -107,7 +124,7 @@ WORKDIR /app
 # ============================================================================
 RUN cat > /app/elminyawe_engine.py <<'PY'
 # ============================================================
-#  ELMINYAWE Engine - Cloudflare Turnstile solving core (v3.3.0)
+#  ELMINYAWE Engine - Cloudflare Turnstile solving core (v3.4.0)
 #  Algorithm: Theyka/Turnstile-Solver (patchright + Turnstile
 #  widget injection + checkbox click loop).
 #  ELMINYAWE hardening for single-container use:
@@ -352,7 +369,7 @@ PY
 # ============================================================================
 RUN cat > /app/elminyawe_api.py <<'PY'
 # ============================================================
-#  ELMINYAWE Solver - Public API Gateway (v3.3.0)
+#  ELMINYAWE Solver - Public API Gateway (v3.4.0)
 #  Solves Cloudflare Turnstile challenges; the most important
 #  values (the token) come FIRST in every response.
 #
@@ -410,8 +427,11 @@ from starlette.concurrency import run_in_threadpool
 # --- engine (must be imported after the API's own config below) -------------
 from elminyawe_engine import TurnstileSolver, DEFAULT_UA
 
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 SERVICE_NAME = "ELMINYAWE Solver"
+#  Listening ports reported by /health (populated by elminyawe_launch.py:
+#  primary public API port first, platform compat alias second, if any).
+_LISTENERS = os.environ.get("ELMINYAWE_LISTENERS", "8191")
 
 MAX_CONCURRENT = max(1, int(os.environ.get("MAX_CONCURRENT_SOLVES", "2")))
 WORKER_WAIT = int(os.environ.get("WORKER_WAIT_TIMEOUT", "5"))
@@ -995,6 +1015,7 @@ def health():
         "browser": _BROWSER_DETAIL,
         "engine_ready": _BROWSER_OK,
         "max_concurrent": MAX_CONCURRENT,
+        "listeners": [p for p in _LISTENERS.split(",") if p],
         "version": VERSION,
     }
 
@@ -1381,7 +1402,83 @@ log.info("%s v%s ready | browser: %s | max_concurrent=%d",
 PY
 
 # ============================================================================
-#  EMBEDDED FILE 3/3 : /app/start_elminyawe.sh
+#  EMBEDDED FILE 3/4 : /app/elminyawe_launch.py
+#  Port architecture (v3.4.0): the API gateway is the single public entry
+#  on ELMINYAWE_PORT (8191). If the platform injects its own PORT (Railway
+#  does: 8080), the SAME process/app binds it as an extra alias socket, so
+#  whatever the platform's target port is, requests reach the API. The
+#  solving worker itself has no TCP port at all (private Chromium pipe).
+# ============================================================================
+RUN cat > /app/elminyawe_launch.py <<'PY'
+"""ELMINYAWE launcher: one process, one app, explicit listener sockets."""
+import os
+import socket
+import sys
+
+
+def resolve_listeners(env=None):
+    """Return the ordered unique port list.
+
+    1) ELMINYAWE_PORT (default 8191)  -> primary public API port, always first
+    2) PORT (platform-injected, e.g. Railway 8080) -> compat alias, only when
+       it is a valid port number and different from the primary
+    """
+    env = os.environ if env is None else env
+    try:
+        primary = int(str(env.get("ELMINYAWE_PORT", "8191")).strip() or 8191)
+    except (TypeError, ValueError):
+        primary = 8191
+    if not (1 <= primary <= 65535):
+        primary = 8191
+
+    ports = [primary]
+    raw = str(env.get("PORT", "") or "").strip()
+    if raw.isdigit():
+        alias = int(raw)
+        if 1 <= alias <= 65535 and alias != primary:
+            ports.append(alias)
+    return ports
+
+
+def open_sockets(host, ports):
+    socks = []
+    for port in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        s.listen(2048)
+        s.set_inheritable(True)
+        socks.append(s)
+    return socks
+
+
+def main():
+    host = os.environ.get("HOST", "0.0.0.0")
+    ports = resolve_listeners()
+    socks = open_sockets(host, ports)
+    os.environ["ELMINYAWE_LISTENERS"] = ",".join(str(p) for p in ports)
+
+    import uvicorn
+    from elminyawe_api import app  # noqa: F401  (single shared app instance)
+
+    for port in ports:
+        print(f"[ELMINYAWE] API listening on {host}:{port}", flush=True)
+    print("[ELMINYAWE] worker: internal (in-process Chromium, no TCP port)",
+          flush=True)
+
+    cfg = uvicorn.Config("elminyawe_api:app", log_level="info", workers=1)
+    server = uvicorn.Server(cfg)
+    import asyncio
+    asyncio.run(server.serve(sockets=socks))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
+PY
+RUN chmod +x /app/elminyawe_launch.py
+# ============================================================================
+#  EMBEDDED FILE 4/4 : /app/start_elminyawe.sh
 #  Entrypoint — optional virtual display, preflight checks, single process.
 # ============================================================================
 RUN cat > /app/start_elminyawe.sh <<'SH'
@@ -1389,21 +1486,24 @@ RUN cat > /app/start_elminyawe.sh <<'SH'
 # ============================================================
 #  ELMINYAWE Solver - container entrypoint (embedded)
 #  Single process: the ELMINYAWE API. The engine runs inside
-#  it (one isolated browser per solve).
-#  v3.3.0: headed stealth mode by default - the browser runs
-#  on the built-in virtual display (Xvfb), exactly like the
-#  reference Docker recipe. Headless stays available via
-#  ELMINYAWE_HEADLESS=true.
+#  it (one isolated browser per solve, private pipe, no port).
+#  v3.4.0 port architecture: the API is the single public
+#  entry on ELMINYAWE_PORT (8191); a platform-injected PORT
+#  (e.g. Railway 8080) is bound by the SAME process as an
+#  alias, so any platform target port reaches the API.
+#  Headed stealth mode by default (Xvfb :99); headless stays
+#  available via ELMINYAWE_HEADLESS=true.
 # ============================================================
 set -e
-cd /app
-export PYTHONPATH=/app
+cd "$(dirname "$0")"
+export PYTHONPATH="$(pwd)"
 export PYTHONUNBUFFERED=1
 
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-8191}"
+ELMINYAWE_PORT="${ELMINYAWE_PORT:-8191}"
+export ELMINYAWE_PORT
 
-echo "[ELMINYAWE] Solver v3.3.0 - starting"
+echo "[ELMINYAWE] Solver v3.4.0 - starting"
 
 #  headed stealth mode (default): serve the browser a virtual display
 if [ "${ELMINYAWE_HEADLESS:-false}" = "false" ] && [ -z "${DISPLAY:-}" ]; then
@@ -1439,14 +1539,13 @@ else:
     print("[ELMINYAWE] WARNING: chromium not found in patchright cache")
 PY
 
-echo "[ELMINYAWE] API listening on ${HOST}:${PORT}"
-exec python -m uvicorn elminyawe_api:app --host "$HOST" --port "$PORT" --workers 1
+exec python elminyawe_launch.py
 SH
 RUN chmod +x /app/start_elminyawe.sh
 
-EXPOSE 8191
+EXPOSE 8191 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD python -c "import urllib.request as u,sys,os; r=u.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8191')+'/health',timeout=4); sys.exit(0 if r.getcode()==200 else 1)" || exit 1
+  CMD python -c "import urllib.request as u,sys,os; p=os.environ.get('ELMINYAWE_PORT','8191'); r=u.urlopen('http://127.0.0.1:'+p+'/health',timeout=4); sys.exit(0 if r.getcode()==200 else 1)" || exit 1
 
 CMD ["/app/start_elminyawe.sh"]
