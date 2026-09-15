@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ============================================================================
-#  ELMINYAWE Solver  v3.0.0  —  Single-Container Edition
+#  ELMINYAWE Solver  v3.1.0  —  Single-Container Edition
 # ----------------------------------------------------------------------------
 #  Cloudflare Turnstile solving behind the ELMINYAWE API.
 #  Engine: Theyka/Turnstile-Solver algorithm (patchright + Turnstile widget),
@@ -18,6 +18,9 @@
 #    GET  /health
 #  'sitekey' is optional: if omitted, the API fetches the target page and
 #  tries to auto-detect the Turnstile widget settings (sitekey/action/cdata).
+#  'secret' is optional: when given, the API validates the token through
+#  Cloudflare siteverify and returns the verdict inline (result.siteverify).
+#  Standalone validation:  GET/POST /siteverify  (token + secret).
 #
 #  ENV CONFIG (all optional):
 #    PORT=8191                 API port
@@ -71,7 +74,7 @@ WORKDIR /app
 # ============================================================================
 RUN cat > /app/elminyawe_engine.py <<'PY'
 # ============================================================
-#  ELMINYAWE Engine - Cloudflare Turnstile solving core (v3.0.0)
+#  ELMINYAWE Engine - Cloudflare Turnstile solving core (v3.1.0)
 #  Algorithm: Theyka/Turnstile-Solver (patchright + Turnstile
 #  widget injection + checkbox click loop).
 #  ELMINYAWE hardening for single-container use:
@@ -270,27 +273,31 @@ PY
 # ============================================================================
 RUN cat > /app/elminyawe_api.py <<'PY'
 # ============================================================
-#  ELMINYAWE Solver - Public API Gateway (v3.0.0)
+#  ELMINYAWE Solver - Public API Gateway (v3.1.0)
 #  Solves Cloudflare Turnstile challenges; the most important
 #  values (the token) come FIRST in every response.
 #
 #  Endpoints:
 #    GET  /                       -> service info
 #    GET  /health                 -> health check
-#    GET  /solve?url=&sitekey=    -> quick solve (sitekey optional)
+#    GET  /solve?url=&sitekey=&secret=  -> quick solve (both optional)
 #    POST /v1 {url, sitekey?, action?, cdata?, proxy?, headless?,
-#              useragent?, maxTimeout?}
+#              useragent?, maxTimeout?, secret?}
+#    GET/POST /siteverify {token, secret} -> validate any token through
+#              Cloudflare siteverify and return the verdict
 #
 #  Fully white-labeled: everything appears as ELMINYAWE.
 # ============================================================
 import os
 import re
+import json
 import time
 import glob
 import inspect
 import logging
 import ssl
 import threading
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -303,13 +310,19 @@ from starlette.concurrency import run_in_threadpool
 # --- engine (must be imported after the API's own config below) -------------
 from elminyawe_engine import TurnstileSolver, DEFAULT_UA
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 SERVICE_NAME = "ELMINYAWE Solver"
 
 MAX_CONCURRENT = max(1, int(os.environ.get("MAX_CONCURRENT_SOLVES", "2")))
 WORKER_WAIT = int(os.environ.get("WORKER_WAIT_TIMEOUT", "5"))
 PAGE_FETCH_TIMEOUT = int(os.environ.get("PAGE_FETCH_TIMEOUT", "15"))
+SITEVERIFY_TIMEOUT = int(os.environ.get("SITEVERIFY_TIMEOUT", "10"))
 MAX_HTML_BYTES = 3_000_000
+SITEVERIFY_MAX_BYTES = 1_000_000
+# Cloudflare's documented behavior: Turnstile TEST sitekeys always return
+# this exact dummy token (developers.cloudflare.com/turnstile/troubleshooting/testing)
+DUMMY_TOKEN = "XXXX.DUMMY.TOKEN.XXXX"
+SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 HEADLESS_DEFAULT = os.environ.get("ELMINYAWE_HEADLESS", "true").strip().lower() not in (
     "0", "false", "no", "off",
 )
@@ -453,36 +466,107 @@ def _solve_turnstile(url, sitekey, action=None, cdata=None, proxy=None,
 
 
 # ------------------------------------------------------------------
+#  Server-side validation through Cloudflare siteverify (optional)
+# ------------------------------------------------------------------
+def _siteverify(token, secret):
+    """Validate a Turnstile token server-side via Cloudflare siteverify."""
+    t0 = _now_ms()
+    data = urllib.parse.urlencode({
+        "secret": str(secret),
+        "response": str(token),
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            SITEVERIFY_URL,
+            data=data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": _UA,
+            },
+            method="POST",
+        )
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(
+            req, timeout=SITEVERIFY_TIMEOUT, context=ctx
+        ) as resp:
+            payload = json.loads(
+                resp.read(SITEVERIFY_MAX_BYTES).decode("utf-8", "replace")
+            )
+        if not isinstance(payload, dict):
+            raise ValueError("siteverify returned a non-object payload")
+        out = {
+            "success": bool(payload.get("success")),
+            "challenge_ts": payload.get("challenge_ts"),
+            "hostname": payload.get("hostname"),
+            "error_codes": payload.get("error-codes") or [],
+        }
+        if payload.get("messages"):
+            out["messages"] = payload["messages"]
+        if isinstance(payload.get("metadata"), dict):
+            out["metadata"] = payload["metadata"]
+        out["verified_in_ms"] = _now_ms() - t0
+        return out
+    except Exception as exc:
+        return {
+            "success": None,
+            "error": _rebrand(f"{type(exc).__name__}: {exc}"),
+            "verified_in_ms": _now_ms() - t0,
+        }
+
+
+# ------------------------------------------------------------------
 #  Response builders (ELMINYAWE envelope, token first)
 # ------------------------------------------------------------------
 def _ok_body(url, sitekey, sitekey_source, token, widget, action, cdata,
-             proxy, headless, useragent, started, engine_result):
+             proxy, headless, useragent, started, engine_result,
+             siteverify=None):
     ended = _now_ms()
-    body = {
+    result = {
+        "token": token,
+        "cf_tokens": {"cf-turnstile-response": token},
+    }
+    if siteverify is not None:
+        result["siteverify"] = siteverify
+    result.update({
+        "url": url,
+        "sitekey": sitekey,
+        "sitekey_source": sitekey_source,
+        "challenge_solved": True,
+        "action": action,
+        "cdata": cdata,
+        "proxy": proxy or None,
+        "user_agent": useragent,
+        "browser_type": "chromium",
+        "headless": bool(headless),
+        "widget": widget or {},
+        "timing": {
+            "solve_seconds": engine_result.elapsed_time_seconds,
+            "total_ms": ended - started,
+        },
+    })
+    if token.upper() == DUMMY_TOKEN:
+        result["token_type"] = "cloudflare_dummy_token"
+        result["note"] = (
+            "This is Cloudflare's official DUMMY token: the target page uses a "
+            "Turnstile TEST sitekey (e.g. 1x00000000000000000000AA). Cloudflare's "
+            "documentation defines test sitekeys to always return "
+            "'XXXX.DUMMY.TOKEN.XXXX', so this token proves the whole solving "
+            "pipeline works. Dummy tokens are only accepted by Cloudflare TEST "
+            "secret keys; real sitekeys produce production tokens that start "
+            "with '0.'"
+        )
+    elif not token.startswith("0."):
+        result["warning"] = (
+            "token format looks unusual "
+            "(Turnstile tokens normally start with '0.')"
+        )
+    return {
         "status": "ok",
         "message": "Challenge solved!",
         "start_timestamp": started,
         "end_timestamp": ended,
         "version": VERSION,
-        "result": {
-            "token": token,
-            "cf_tokens": {"cf-turnstile-response": token},
-            "url": url,
-            "sitekey": sitekey,
-            "sitekey_source": sitekey_source,
-            "challenge_solved": True,
-            "action": action,
-            "cdata": cdata,
-            "proxy": proxy or None,
-            "user_agent": useragent,
-            "browser_type": "chromium",
-            "headless": bool(headless),
-            "widget": widget or {},
-            "timing": {
-                "solve_seconds": engine_result.elapsed_time_seconds,
-                "total_ms": ended - started,
-            },
-        },
+        "result": result,
         "solution": {
             "token": token,
             "turnstile_response": token,
@@ -490,12 +574,6 @@ def _ok_body(url, sitekey, sitekey_source, token, widget, action, cdata,
             "sitekey": sitekey,
         },
     }
-    if not token.startswith("0."):
-        body["result"]["warning"] = (
-            "token format looks unusual "
-            "(Turnstile tokens normally start with '0.')"
-        )
-    return body
 
 
 def _error_body(message, started, err_type=None, detail=None, extra=None):
@@ -521,7 +599,7 @@ def _error_body(message, started, err_type=None, detail=None, extra=None):
 #  Shared handler for GET /solve and POST /v1
 # ------------------------------------------------------------------
 def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
-            headless=None, useragent=None, max_timeout=None):
+            headless=None, useragent=None, max_timeout=None, secret=None):
     started = _now_ms()
     try:
         if not url or not re.match(r"^https?://", str(url).strip(), re.I):
@@ -598,12 +676,17 @@ def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
         if engine_result.status == "success" and token and len(token) >= 20:
             log.info("solved in %ss (token=%s...)",
                      engine_result.elapsed_time_seconds, token[:12])
+            verify_block = None
+            if secret:
+                log.info("validating the token through Cloudflare siteverify")
+                verify_block = _siteverify(token, str(secret).strip())
             body = _ok_body(url=url, sitekey=sitekey,
                             sitekey_source=sitekey_source, token=token,
                             widget=widget, action=action, cdata=cdata,
                             proxy=proxy, headless=headless,
                             useragent=effective_ua, started=started,
-                            engine_result=engine_result)
+                            engine_result=engine_result,
+                            siteverify=verify_block)
             return body, 200
 
         if engine_result.status == "failure":
@@ -651,11 +734,16 @@ def root():
             "GET /": "service information (this page)",
             "GET /health": "health check",
             "GET /solve": ("quick solve: /solve?url=<page>&sitekey=<optional>"
-                           "&action=<optional>&cdata=<optional>&proxy=<optional>"),
+                           "&action=<optional>&cdata=<optional>&proxy=<optional>"
+                           "&secret=<optional: validate the token via siteverify>"),
             "POST /v1": ("full solve body: {\"url\": ..., \"sitekey\"?: ..., "
                          "\"action\"?: ..., \"cdata\"?: ..., \"proxy\"?: ..., "
                          "\"headless\"?: true, \"useragent\"?: ..., "
-                         "\"maxTimeout\"?: 60000}"),
+                         "\"maxTimeout\"?: 60000, \"secret\"?: ...}"),
+            "GET /siteverify": ("validate any token: "
+                                "/siteverify?token=<token>&secret=<secret>"),
+            "POST /siteverify": ("validate any token: "
+                                 "{\"token\": ..., \"secret\": ...}"),
         },
     }
 
@@ -681,10 +769,11 @@ def solve_get(
     headless: Optional[bool] = Query(None),
     useragent: Optional[str] = Query(None),
     maxTimeout: Optional[int] = Query(None),
+    secret: Optional[str] = Query(None),
 ):
     body, code = _handle(url, sitekey=sitekey, action=action, cdata=cdata,
                          proxy=proxy, headless=headless, useragent=useragent,
-                         max_timeout=maxTimeout)
+                         max_timeout=maxTimeout, secret=secret)
     return JSONResponse(status_code=code, content=body)
 
 
@@ -708,6 +797,69 @@ async def v1(request: Request):
         headless=payload.get("headless"),
         useragent=payload.get("useragent") or payload.get("user_agent"),
         max_timeout=payload.get("maxTimeout") or payload.get("max_timeout"),
+        secret=payload.get("secret") or payload.get("siteverify_secret"),
+    )
+    return JSONResponse(status_code=code, content=body)
+
+
+# ------------------------------------------------------------------
+#  Standalone token validation (Cloudflare siteverify)
+# ------------------------------------------------------------------
+def _verify_handle(token, secret):
+    started = _now_ms()
+    if not token or not str(token).strip():
+        return (_error_body("A 'token' is required to verify",
+                            started, "InvalidInput"), 400)
+    if not secret or not str(secret).strip():
+        return (_error_body(
+            "A 'secret' is required (the Turnstile secret key paired with the sitekey)",
+            started, "InvalidInput"), 400)
+    token = str(token).strip()
+    verdict = _siteverify(token, str(secret).strip())
+    if verdict.get("success") is None:
+        return (_error_body(
+            "Could not reach Cloudflare siteverify, try again",
+            started, "SiteverifyUnreachable", detail=verdict.get("error"),
+            extra={"token": token}), 502)
+    accepted = bool(verdict.get("success"))
+    body = {
+        "status": "ok" if accepted else "error",
+        "message": ("Token accepted by Cloudflare siteverify" if accepted
+                    else "Token rejected by Cloudflare siteverify"),
+        "start_timestamp": started,
+        "end_timestamp": _now_ms(),
+        "version": VERSION,
+        "result": {
+            "token": token,
+            "siteverify": verdict,
+        },
+    }
+    if token.upper() == DUMMY_TOKEN:
+        body["result"]["token_type"] = "cloudflare_dummy_token"
+    return body, 200
+
+
+@app.get("/siteverify")
+def siteverify_get(
+    token: str = Query(...),
+    secret: str = Query(...),
+):
+    body, code = _verify_handle(token, secret)
+    return JSONResponse(status_code=code, content=body)
+
+
+@app.post("/siteverify")
+async def siteverify_post(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    body, code = await run_in_threadpool(
+        _verify_handle,
+        payload.get("token") or payload.get("response"),
+        payload.get("secret"),
     )
     return JSONResponse(status_code=code, content=body)
 
@@ -762,7 +914,7 @@ export PYTHONUNBUFFERED=1
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8191}"
 
-echo "[ELMINYAWE] Solver v3.0.0 - starting"
+echo "[ELMINYAWE] Solver v3.1.0 - starting"
 
 # optional headed (stealth) mode: serve the browser a virtual display
 if [ "${ELMINYAWE_HEADLESS:-true}" = "false" ] && [ -z "${DISPLAY:-}" ]; then
