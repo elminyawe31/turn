@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ============================================================================
-#  ELMINYAWE Solver  v3.1.0  —  Single-Container Edition
+#  ELMINYAWE Solver  v3.2.0  —  Single-Container Edition
 # ----------------------------------------------------------------------------
 #  Cloudflare Turnstile solving behind the ELMINYAWE API.
 #  Engine: Theyka/Turnstile-Solver algorithm (patchright + Turnstile widget),
@@ -21,6 +21,11 @@
 #  'secret' is optional: when given, the API validates the token through
 #  Cloudflare siteverify and returns the verdict inline (result.siteverify).
 #  Standalone validation:  GET/POST /siteverify  (token + secret).
+#  'browser' is optional: chromium (default) | chrome | msedge.
+#  ASYNC FLOW (Theyka-style task API, richer envelope):
+#    POST /task {url, sitekey?, ...}      -> 202 {"task_id": ...}
+#    GET  /result?task_id=...             -> poll until the token is ready
+#    GET  /tasks                          -> tracked tasks overview
 #
 #  ENV CONFIG (all optional):
 #    PORT=8191                 API port
@@ -32,6 +37,9 @@
 #    ELMINYAWE_UA=<chrome ua>  browser User-Agent (required for headless mode)
 #    ELMINYAWE_HEADLESS=true   false = use the built-in virtual display (Xvfb)
 #    PAGE_FETCH_TIMEOUT=15     seconds for the sitekey auto-detection fetch
+#    TASK_TTL_SECONDS=1800     how long finished async tasks are kept
+#    TASK_WAIT_TIMEOUT=120     seconds an async task may wait for a free slot
+#    ELMINYAWE_BROWSER=chromium  default browser channel (chromium|chrome|msedge)
 # ============================================================================
 
 FROM python:3.11-slim
@@ -74,11 +82,13 @@ WORKDIR /app
 # ============================================================================
 RUN cat > /app/elminyawe_engine.py <<'PY'
 # ============================================================
-#  ELMINYAWE Engine - Cloudflare Turnstile solving core (v3.1.0)
+#  ELMINYAWE Engine - Cloudflare Turnstile solving core (v3.2.0)
 #  Algorithm: Theyka/Turnstile-Solver (patchright + Turnstile
 #  widget injection + checkbox click loop).
 #  ELMINYAWE hardening for single-container use:
 #    - Docker-safe Chromium launch flags (--no-sandbox, --disable-dev-shm-usage)
+#    - browser channel support: chromium (full build, new headless) /
+#      chrome / msedge (system installs) like the reference API server
 #    - per-solve proxy support (parsed into patchright format)
 #    - configurable attempts / user-agent / headless
 # ============================================================
@@ -107,6 +117,15 @@ DOCKER_ARGS = [
     "--no-default-browser-check",
     "--window-size=1280,720",
 ]
+
+# Browser channel per browser_type (same mapping the reference API server
+# passes to patchright: chromium = full build with the new headless mode,
+# chrome/msedge = system-installed browsers when present)
+BROWSER_CHANNELS = {
+    "chromium": "chromium",
+    "chrome": "chrome",
+    "msedge": "msedge",
+}
 
 
 @dataclass
@@ -193,6 +212,7 @@ class TurnstileSolver:
         try:
             playwright = sync_playwright().start()
             browser = playwright.chromium.launch(
+                channel=BROWSER_CHANNELS.get(self.browser_type, "chromium"),
                 headless=self.headless,
                 args=self.browser_args,
             )
@@ -273,7 +293,7 @@ PY
 # ============================================================================
 RUN cat > /app/elminyawe_api.py <<'PY'
 # ============================================================
-#  ELMINYAWE Solver - Public API Gateway (v3.1.0)
+#  ELMINYAWE Solver - Public API Gateway (v3.2.0)
 #  Solves Cloudflare Turnstile challenges; the most important
 #  values (the token) come FIRST in every response.
 #
@@ -285,6 +305,13 @@ RUN cat > /app/elminyawe_api.py <<'PY'
 #              useragent?, maxTimeout?, secret?}
 #    GET/POST /siteverify {token, secret} -> validate any token through
 #              Cloudflare siteverify and return the verdict
+#    GET/POST /task {url, sitekey?, ...}  -> async solve, returns task_id
+#              immediately (202); solve runs in the background
+#    GET  /result?task_id=...             -> poll an async task for the token
+#    GET  /tasks                          -> list tracked tasks
+#
+#  'browser' is optional everywhere: chromium (default, full build with
+#  new headless), chrome, msedge (system installs when present).
 #
 #  Fully white-labeled: everything appears as ELMINYAWE.
 # ============================================================
@@ -299,6 +326,7 @@ import ssl
 import threading
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Optional
 
 from fastapi import FastAPI, Request, Query
@@ -310,7 +338,7 @@ from starlette.concurrency import run_in_threadpool
 # --- engine (must be imported after the API's own config below) -------------
 from elminyawe_engine import TurnstileSolver, DEFAULT_UA
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 SERVICE_NAME = "ELMINYAWE Solver"
 
 MAX_CONCURRENT = max(1, int(os.environ.get("MAX_CONCURRENT_SOLVES", "2")))
@@ -323,6 +351,10 @@ SITEVERIFY_MAX_BYTES = 1_000_000
 # this exact dummy token (developers.cloudflare.com/turnstile/troubleshooting/testing)
 DUMMY_TOKEN = "XXXX.DUMMY.TOKEN.XXXX"
 SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+# Async task API (task_id + /result polling)
+TASK_TTL = int(os.environ.get("TASK_TTL_SECONDS", "1800"))
+TASK_WAIT = int(os.environ.get("TASK_WAIT_TIMEOUT", "120"))
+ALLOWED_BROWSERS = ("chromium", "chrome", "msedge")
 HEADLESS_DEFAULT = os.environ.get("ELMINYAWE_HEADLESS", "true").strip().lower() not in (
     "0", "false", "no", "off",
 )
@@ -455,10 +487,12 @@ def _inspect_page(url: str):
 #  Engine bridge
 # ------------------------------------------------------------------
 def _solve_turnstile(url, sitekey, action=None, cdata=None, proxy=None,
-                     headless=True, useragent=None, attempts=None):
+                     headless=True, useragent=None, attempts=None,
+                     browser=None):
     solver = TurnstileSolver(
         headless=headless,
         useragent=useragent,
+        browser_type=browser or "chromium",
         attempts=attempts,
     )
     return solver.solve(url=url, sitekey=sitekey, action=action,
@@ -519,7 +553,7 @@ def _siteverify(token, secret):
 # ------------------------------------------------------------------
 def _ok_body(url, sitekey, sitekey_source, token, widget, action, cdata,
              proxy, headless, useragent, started, engine_result,
-             siteverify=None):
+             siteverify=None, browser=None):
     ended = _now_ms()
     result = {
         "token": token,
@@ -536,7 +570,7 @@ def _ok_body(url, sitekey, sitekey_source, token, widget, action, cdata,
         "cdata": cdata,
         "proxy": proxy or None,
         "user_agent": useragent,
-        "browser_type": "chromium",
+        "browser_type": browser or "chromium",
         "headless": bool(headless),
         "widget": widget or {},
         "timing": {
@@ -599,7 +633,8 @@ def _error_body(message, started, err_type=None, detail=None, extra=None):
 #  Shared handler for GET /solve and POST /v1
 # ------------------------------------------------------------------
 def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
-            headless=None, useragent=None, max_timeout=None, secret=None):
+            headless=None, useragent=None, max_timeout=None, secret=None,
+            browser=None, worker_wait=None):
     started = _now_ms()
     try:
         if not url or not re.match(r"^https?://", str(url).strip(), re.I):
@@ -607,6 +642,14 @@ def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
                 "A valid 'url' (http/https) is required",
                 started, "InvalidInput"), 400)
         url = str(url).strip()
+
+        if browser is not None:
+            browser = str(browser).strip().lower() or None
+            if browser and browser not in ALLOWED_BROWSERS:
+                return (_error_body(
+                    f"Unsupported browser '{browser}'; "
+                    f"supported: {', '.join(ALLOWED_BROWSERS)}",
+                    started, "InvalidInput"), 400)
 
         if isinstance(proxy, dict):
             proxy = proxy.get("url") or proxy.get("server") or None
@@ -657,17 +700,20 @@ def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
         effective_ua = useragent or DEFAULT_UA
         headless = HEADLESS_DEFAULT if headless is None else bool(headless)
 
-        if not _WORKERS.acquire(timeout=WORKER_WAIT):
+        if not _WORKERS.acquire(
+            timeout=WORKER_WAIT if worker_wait is None else worker_wait
+        ):
             return (_error_body(
                 "Solver busy: all worker slots are in use, retry shortly",
                 started, "Busy"), 503)
         try:
-            log.info("solving: %s | sitekey=%s... | action=%s | proxy=%s",
-                     url, (sitekey or "?")[:12], action or "-", bool(proxy))
+            log.info("solving: %s | sitekey=%s... | action=%s | proxy=%s | browser=%s",
+                     url, (sitekey or "?")[:12], action or "-", bool(proxy),
+                     browser or "chromium")
             engine_result = _solve_turnstile(
                 url=url, sitekey=sitekey, action=action, cdata=cdata,
                 proxy=proxy, headless=headless,
-                useragent=useragent, attempts=attempts,
+                useragent=useragent, attempts=attempts, browser=browser,
             )
         finally:
             _WORKERS.release()
@@ -686,7 +732,7 @@ def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
                             proxy=proxy, headless=headless,
                             useragent=effective_ua, started=started,
                             engine_result=engine_result,
-                            siteverify=verify_block)
+                            siteverify=verify_block, browser=browser)
             return body, 200
 
         if engine_result.status == "failure":
@@ -735,11 +781,16 @@ def root():
             "GET /health": "health check",
             "GET /solve": ("quick solve: /solve?url=<page>&sitekey=<optional>"
                            "&action=<optional>&cdata=<optional>&proxy=<optional>"
-                           "&secret=<optional: validate the token via siteverify>"),
+                           "&secret=<optional siteverify>&browser=<optional>"),
             "POST /v1": ("full solve body: {\"url\": ..., \"sitekey\"?: ..., "
                          "\"action\"?: ..., \"cdata\"?: ..., \"proxy\"?: ..., "
                          "\"headless\"?: true, \"useragent\"?: ..., "
-                         "\"maxTimeout\"?: 60000, \"secret\"?: ...}"),
+                         "\"maxTimeout\"?: 60000, \"secret\"?: ..., "
+                         "\"browser\"?: \"chromium|chrome|msedge\"}"),
+            "GET/POST /task": ("async solve (returns task_id immediately, 202): "
+                               "same parameters as /solve and /v1"),
+            "GET /result": ("poll an async task: /result?task_id=<task_id>"),
+            "GET /tasks": "list tracked tasks",
             "GET /siteverify": ("validate any token: "
                                 "/siteverify?token=<token>&secret=<secret>"),
             "POST /siteverify": ("validate any token: "
@@ -770,10 +821,11 @@ def solve_get(
     useragent: Optional[str] = Query(None),
     maxTimeout: Optional[int] = Query(None),
     secret: Optional[str] = Query(None),
+    browser: Optional[str] = Query(None),
 ):
     body, code = _handle(url, sitekey=sitekey, action=action, cdata=cdata,
                          proxy=proxy, headless=headless, useragent=useragent,
-                         max_timeout=maxTimeout, secret=secret)
+                         max_timeout=maxTimeout, secret=secret, browser=browser)
     return JSONResponse(status_code=code, content=body)
 
 
@@ -798,8 +850,185 @@ async def v1(request: Request):
         useragent=payload.get("useragent") or payload.get("user_agent"),
         max_timeout=payload.get("maxTimeout") or payload.get("max_timeout"),
         secret=payload.get("secret") or payload.get("siteverify_secret"),
+        browser=payload.get("browser") or payload.get("browser_type"),
     )
     return JSONResponse(status_code=code, content=body)
+
+
+# ------------------------------------------------------------------
+#  Async task API (task_id + /result polling)
+# ------------------------------------------------------------------
+_TASKS = {}
+_TASKS_LOCK = threading.Lock()
+
+
+def _task_cleanup():
+    """Drop finished tasks older than the TTL."""
+    now = _now_ms()
+    with _TASKS_LOCK:
+        expired = [tid for tid, t in _TASKS.items()
+                   if t.get("finished_at")
+                   and now - t["finished_at"] > TASK_TTL * 1000]
+        for tid in expired:
+            _TASKS.pop(tid, None)
+
+
+def _task_worker(task_id, kwargs):
+    with _TASKS_LOCK:
+        task = _TASKS.get(task_id)
+        if task is not None:
+            task["status"] = "processing"
+    try:
+        body, _code = _handle(worker_wait=TASK_WAIT, **kwargs)
+        status = "ok" if body.get("status") == "ok" else "error"
+    except Exception as exc:
+        log.exception("task %s failed unexpectedly", task_id)
+        body = _error_body(
+            f"Unexpected internal error: {type(exc).__name__}: {exc}",
+            _now_ms(), "InternalError")
+        status = "error"
+    with _TASKS_LOCK:
+        task = _TASKS.get(task_id)
+        if task is not None:
+            task["status"] = status
+            task["finished_at"] = _now_ms()
+            task["body"] = body
+
+
+def _create_task(payload):
+    """Validate a solve request and queue it as a background task."""
+    now = _now_ms()
+    url = payload.get("url")
+    if not url or not re.match(r"^https?://", str(url).strip(), re.I):
+        return (_error_body("A valid 'url' (http/https) is required",
+                            now, "InvalidInput"), 400)
+    browser = payload.get("browser")
+    if browser is not None:
+        browser = str(browser).strip().lower() or None
+        if browser and browser not in ALLOWED_BROWSERS:
+            return (_error_body(
+                f"Unsupported browser '{browser}'; "
+                f"supported: {', '.join(ALLOWED_BROWSERS)}",
+                now, "InvalidInput"), 400)
+    solve_kwargs = {
+        "url": str(url).strip(),
+        "sitekey": (payload.get("sitekey") or payload.get("siteKey")
+                    or payload.get("site_key")),
+        "action": payload.get("action"),
+        "cdata": payload.get("cdata"),
+        "proxy": payload.get("proxy"),
+        "headless": payload.get("headless"),
+        "useragent": payload.get("useragent") or payload.get("user_agent"),
+        "max_timeout": payload.get("maxTimeout") or payload.get("max_timeout"),
+        "secret": payload.get("secret") or payload.get("siteverify_secret"),
+        "browser": browser,
+    }
+    task_id = str(uuid.uuid4())
+    with _TASKS_LOCK:
+        _TASKS[task_id] = {
+            "status": "queued",
+            "url": solve_kwargs["url"],
+            "created_at": now,
+            "finished_at": None,
+            "body": None,
+        }
+    threading.Thread(target=_task_worker,
+                     args=(task_id, solve_kwargs), daemon=True).start()
+    _task_cleanup()
+    body = {
+        "task_id": task_id,
+        "status": "queued",
+        "message": "task accepted; poll GET /result?task_id=<task_id> for the token",
+        "start_timestamp": now,
+        "end_timestamp": now,
+        "version": VERSION,
+        "task": {
+            "url": solve_kwargs["url"],
+            "sitekey": solve_kwargs["sitekey"] or "auto_detect",
+            "browser": browser or "chromium",
+            "created_at": now,
+        },
+    }
+    return body, 202
+
+
+def _task_view(task_id):
+    with _TASKS_LOCK:
+        task = _TASKS.get(task_id)
+        if task is None:
+            return (_error_body("Unknown or expired task_id",
+                                _now_ms(), "TaskNotFound"), 404)
+        if task["body"] is not None:
+            out = {"task_id": task_id}
+            out.update(task["body"])
+            return out, 200
+        return {
+            "task_id": task_id,
+            "status": task["status"],
+            "message": "solve in progress; poll GET /result?task_id=<task_id>",
+            "start_timestamp": task["created_at"],
+            "version": VERSION,
+        }, 200
+
+
+@app.get("/task")
+def task_get(
+    url: str = Query(...),
+    sitekey: Optional[str] = Query(None),
+    action: Optional[str] = Query(None),
+    cdata: Optional[str] = Query(None),
+    proxy: Optional[str] = Query(None),
+    headless: Optional[bool] = Query(None),
+    useragent: Optional[str] = Query(None),
+    maxTimeout: Optional[int] = Query(None),
+    secret: Optional[str] = Query(None),
+    browser: Optional[str] = Query(None),
+):
+    payload = {"url": url, "sitekey": sitekey, "action": action,
+               "cdata": cdata, "proxy": proxy, "headless": headless,
+               "useragent": useragent, "maxTimeout": maxTimeout,
+               "secret": secret, "browser": browser}
+    body, code = _create_task(payload)
+    return JSONResponse(status_code=code, content=body)
+
+
+@app.post("/task")
+async def task_post(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    body, code = _create_task(payload)
+    return JSONResponse(status_code=code, content=body)
+
+
+@app.get("/result")
+def result_get(task_id: str = Query(...)):
+    body, code = _task_view(str(task_id).strip())
+    return JSONResponse(status_code=code, content=body)
+
+
+@app.get("/tasks")
+def tasks_list():
+    with _TASKS_LOCK:
+        items = [{
+            "task_id": tid,
+            "status": t["status"],
+            "url": t["url"],
+            "created_at": t["created_at"],
+            "finished_at": t["finished_at"],
+        } for tid, t in _TASKS.items()]
+    items.sort(key=lambda x: x["created_at"], reverse=True)
+    active = sum(1 for i in items if i["status"] in ("queued", "processing"))
+    return {
+        "status": "ok",
+        "active_tasks": active,
+        "total_tracked": len(items),
+        "version": VERSION,
+        "tasks": items[:50],
+    }
 
 
 # ------------------------------------------------------------------
@@ -914,7 +1143,7 @@ export PYTHONUNBUFFERED=1
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8191}"
 
-echo "[ELMINYAWE] Solver v3.1.0 - starting"
+echo "[ELMINYAWE] Solver v3.2.0 - starting"
 
 # optional headed (stealth) mode: serve the browser a virtual display
 if [ "${ELMINYAWE_HEADLESS:-true}" = "false" ] && [ -z "${DISPLAY:-}" ]; then
