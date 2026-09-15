@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ============================================================================
-#  ELMINYAWE Solver  v3.2.0  —  Single-Container Edition
+#  ELMINYAWE Solver  v3.3.0  —  Single-Container Edition
 # ----------------------------------------------------------------------------
 #  Cloudflare Turnstile solving behind the ELMINYAWE API.
 #  Engine: Theyka/Turnstile-Solver algorithm (patchright + Turnstile widget),
@@ -8,6 +8,12 @@
 #
 #  ONE image, ONE container, ALL code embedded in this file (heredocs).
 #  Fully white-labeled: the API speaks ELMINYAWE only.
+#
+#  STEALTH POSTURE (v3.3.0, mirrors the proven reference Docker recipe):
+#    - headed browser on a virtual display (Xvfb) by default - not headless
+#    - real browser User-Agent by default (no forced/mismatched UA)
+#    - GPU stack untouched (no --disable-gpu) so WebGL fingerprints stay real
+#    - auto User-Agent (matched to the real browser version) only in headless
 #
 #  BUILD : docker build -t elminyawe-solver .
 #  RUN   : docker run -d -p 8191:8191 --shm-size=256m elminyawe-solver
@@ -22,6 +28,11 @@
 #  Cloudflare siteverify and returns the verdict inline (result.siteverify).
 #  Standalone validation:  GET/POST /siteverify  (token + secret).
 #  'browser' is optional: chromium (default) | chrome | msedge.
+#  SMART DIAGNOSTICS: GET /diagnose checks the engine and the network path
+#  to Cloudflare's challenge infrastructure (IPv4 + IPv6) and can run a live
+#  engine self-test (/diagnose?selftest=true). Failed solves carry targeted
+#  'hints' explaining the most likely environmental cause (e.g. no IPv6
+#  egress for IPv6-only challenge endpoints).
 #  ASYNC FLOW (Theyka-style task API, richer envelope):
 #    POST /task {url, sitekey?, ...}      -> 202 {"task_id": ...}
 #    GET  /result?task_id=...             -> poll until the token is ready
@@ -34,12 +45,18 @@
 #    MAX_CONCURRENT_SOLVES=2   simultaneous browser sessions (RAM guard)
 #    WORKER_WAIT_TIMEOUT=5     seconds a request waits for a free slot (then 503)
 #    SOLVE_ATTEMPTS=10         widget polling attempts per solve (~2.5s each)
-#    ELMINYAWE_UA=<chrome ua>  browser User-Agent (required for headless mode)
-#    ELMINYAWE_HEADLESS=true   false = use the built-in virtual display (Xvfb)
+#    ELMINYAWE_UA=<chrome ua>  force a User-Agent (optional; by default the
+#                              real browser UA is used - headed mode needs none)
+#    ELMINYAWE_HEADLESS=false  false = headed on the built-in Xvfb (default,
+#                              best stealth); true = headless (auto UA applied)
 #    PAGE_FETCH_TIMEOUT=15     seconds for the sitekey auto-detection fetch
 #    TASK_TTL_SECONDS=1800     how long finished async tasks are kept
 #    TASK_WAIT_TIMEOUT=120     seconds an async task may wait for a free slot
 #    ELMINYAWE_BROWSER=chromium  default browser channel (chromium|chrome|msedge)
+#                              (chrome = real Google Chrome, preinstalled here,
+#                               exactly like the reference Docker recipe)
+#    ELMINYAWE_CHROMIUM_ARGS="" extra Chromium launch flags (space-split,
+#                              e.g. "--host-resolver-rules=MAP a.com 1.2.3.4")
 # ============================================================================
 
 FROM python:3.11-slim
@@ -55,22 +72,29 @@ ENV PYTHONUNBUFFERED=1 \
     WORKER_WAIT_TIMEOUT=5 \
     SOLVE_ATTEMPTS=10 \
     PAGE_FETCH_TIMEOUT=15 \
-    ELMINYAWE_HEADLESS=true \
+    ELMINYAWE_HEADLESS=false \
+    ELMINYAWE_CHROMIUM_ARGS="" \
+    ELMINYAWE_BROWSER=chromium \
     TZ=UTC
 
-# --- system: virtual display (optional headed mode) + fonts + certs ----------
+# --- system: virtual display (headed stealth mode) + fonts + certs -----------
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         xvfb \
         fonts-liberation \
+        fonts-dejavu-core \
         ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 # --- engine driver (patchright) + API framework -------------------------------
 RUN pip install --no-cache-dir patchright fastapi "uvicorn[standard]"
 
-# --- browser used by the engine (with all its OS dependencies) ----------------
-RUN python -m patchright install --with-deps chromium
+# --- browsers used by the engine (with all their OS dependencies) -------------
+#  chromium = default channel (patchright full build, new headless capable)
+#  chrome   = real Google Chrome, exactly like the reference Docker recipe;
+#             activate with ELMINYAWE_BROWSER=chrome or "browser": "chrome"
+RUN python -m patchright install --with-deps chromium \
+ && python -m patchright install chrome
 
 WORKDIR /app
 
@@ -78,11 +102,12 @@ WORKDIR /app
 #  EMBEDDED FILE 1/3 : /app/elminyawe_engine.py
 #  ELMINYAWE Turnstile engine — Theyka/Turnstile-Solver solving algorithm
 #  (patchright stealth browser + local widget page + click loop), hardened:
-#  Docker-safe flags, per-solve proxy, configurable attempts/UA/headless.
+#  Docker-safe flags, per-solve proxy, configurable attempts/UA/headless,
+#  optional extra Chromium flags via ELMINYAWE_CHROMIUM_ARGS.
 # ============================================================================
 RUN cat > /app/elminyawe_engine.py <<'PY'
 # ============================================================
-#  ELMINYAWE Engine - Cloudflare Turnstile solving core (v3.2.0)
+#  ELMINYAWE Engine - Cloudflare Turnstile solving core (v3.3.0)
 #  Algorithm: Theyka/Turnstile-Solver (patchright + Turnstile
 #  widget injection + checkbox click loop).
 #  ELMINYAWE hardening for single-container use:
@@ -91,8 +116,16 @@ RUN cat > /app/elminyawe_engine.py <<'PY'
 #      chrome / msedge (system installs) like the reference API server
 #    - per-solve proxy support (parsed into patchright format)
 #    - configurable attempts / user-agent / headless
+#  v3.3.0 stealth posture (reference-parity, proven in production):
+#    - no forced UA by default: headed mode uses the real browser UA
+#      (consistent with navigator.userAgentData - a mismatched UA is a
+#      known detection signal); headless mode auto-builds a UA that
+#      matches the real browser version
+#    - GPU stack untouched (no --disable-gpu/--disable-software-rasterizer)
+#      so WebGL/WebGPU fingerprints stay identical to a real browser
 # ============================================================
 import os
+import shlex
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -103,16 +136,23 @@ from patchright.sync_api import sync_playwright
 DEFAULT_UA = os.environ.get(
     "ELMINYAWE_UA",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+)
+#  Auto UA (headless + none provided): built from the REAL browser version
+#  so navigator.userAgent and the binary always agree on the major version.
+UA_TEMPLATE = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
 )
 DEFAULT_ATTEMPTS = int(os.environ.get("SOLVE_ATTEMPTS", "10"))
 
-# Flags that keep Chromium stable inside containers
+# Flags that keep Chromium stable inside containers.
+#  v3.3.0: --disable-gpu / --disable-software-rasterizer REMOVED on purpose
+#  (the reference solver passes nothing like them; killing the GPU stack
+#  degrades WebGL/WebGPU fingerprints and raises risk scoring).
 DOCKER_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--disable-software-rasterizer",
     "--no-first-run",
     "--no-default-browser-check",
     "--window-size=1280,720",
@@ -197,12 +237,19 @@ class TurnstileSolver:
     def __init__(self, headless: bool = True, useragent: Optional[str] = None,
                  browser_type: str = "chromium", attempts: Optional[int] = None):
         self.headless = bool(headless)
-        self.useragent = useragent or DEFAULT_UA
+        #  v3.3.0 UA policy (reference-parity): only an explicitly provided
+        #  UA (parameter or ELMINYAWE_UA) is forced onto the browser. In
+        #  headed mode the real browser UA is used as-is; in headless mode
+        #  a version-matched UA is auto-built at solve time when none given.
+        self.useragent = useragent or os.environ.get("ELMINYAWE_UA") or None
         self.browser_type = browser_type
         self.attempts = max(1, int(attempts or DEFAULT_ATTEMPTS))
         self.browser_args = list(DOCKER_ARGS)
         if self.useragent:
             self.browser_args.append(f"--user-agent={self.useragent}")
+        extra_args = os.environ.get("ELMINYAWE_CHROMIUM_ARGS", "")
+        if extra_args.strip():
+            self.browser_args.extend(shlex.split(extra_args.strip()))
 
     def solve(self, url: str, sitekey: str, action: Optional[str] = None,
               cdata: Optional[str] = None, proxy: Optional[str] = None) -> TurnstileResult:
@@ -216,7 +263,19 @@ class TurnstileSolver:
                 headless=self.headless,
                 args=self.browser_args,
             )
-            context = browser.new_context(proxy=parse_proxy(proxy))
+            context_kwargs = {"proxy": parse_proxy(proxy)}
+            if self.headless and not self.useragent:
+                #  headless + no explicit UA -> auto UA matching the real
+                #  browser version (navigator.userAgent stays consistent)
+                major = ""
+                try:
+                    major = str(browser.version or "").split(".")[0]
+                except Exception:
+                    pass
+                if not major:
+                    major = DEFAULT_UA.split("Chrome/")[1].split(".")[0]
+                context_kwargs["user_agent"] = UA_TEMPLATE.format(major=major)
+            context = browser.new_context(**context_kwargs)
             page = context.new_page()
 
             url_with_slash = url + "/" if not url.endswith("/") else url
@@ -293,13 +352,17 @@ PY
 # ============================================================================
 RUN cat > /app/elminyawe_api.py <<'PY'
 # ============================================================
-#  ELMINYAWE Solver - Public API Gateway (v3.2.0)
+#  ELMINYAWE Solver - Public API Gateway (v3.3.0)
 #  Solves Cloudflare Turnstile challenges; the most important
 #  values (the token) come FIRST in every response.
 #
 #  Endpoints:
 #    GET  /                       -> service info
 #    GET  /health                 -> health check
+#    GET  /diagnose               -> engine + connectivity diagnostics
+#                                    (IPv4/IPv6 path to the challenge
+#                                    infrastructure; ?selftest=true runs a
+#                                    live solve with a test sitekey)
 #    GET  /solve?url=&sitekey=&secret=  -> quick solve (both optional)
 #    POST /v1 {url, sitekey?, action?, cdata?, proxy?, headless?,
 #              useragent?, maxTimeout?, secret?}
@@ -311,12 +374,21 @@ RUN cat > /app/elminyawe_api.py <<'PY'
 #    GET  /tasks                          -> list tracked tasks
 #
 #  'browser' is optional everywhere: chromium (default, full build with
-#  new headless), chrome, msedge (system installs when present).
+#  new headless), chrome (real Google Chrome, preinstalled), msedge.
+#  STEALTH POSTURE: headed browser on the built-in virtual display by
+#  default with the real browser User-Agent (reference solver parity);
+#  headless mode auto-uses a version-matched UA. A mismatched/forced UA
+#  is a known Cloudflare detection signal - that is why v3.3.0 never
+#  forces one unless explicitly asked (useragent param / ELMINYAWE_UA).
+#  Failed solves carry targeted 'hints' (result.hints) diagnosing the most
+#  likely environmental cause (e.g. missing IPv6 egress for IPv6-only
+#  challenge endpoints) - same smart-inspection spirit as sitekey detection.
 #
 #  Fully white-labeled: everything appears as ELMINYAWE.
 # ============================================================
 import os
 import re
+import socket
 import json
 import time
 import glob
@@ -338,7 +410,7 @@ from starlette.concurrency import run_in_threadpool
 # --- engine (must be imported after the API's own config below) -------------
 from elminyawe_engine import TurnstileSolver, DEFAULT_UA
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 SERVICE_NAME = "ELMINYAWE Solver"
 
 MAX_CONCURRENT = max(1, int(os.environ.get("MAX_CONCURRENT_SOLVES", "2")))
@@ -355,7 +427,10 @@ SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 TASK_TTL = int(os.environ.get("TASK_TTL_SECONDS", "1800"))
 TASK_WAIT = int(os.environ.get("TASK_WAIT_TIMEOUT", "120"))
 ALLOWED_BROWSERS = ("chromium", "chrome", "msedge")
-HEADLESS_DEFAULT = os.environ.get("ELMINYAWE_HEADLESS", "true").strip().lower() not in (
+BROWSER_DEFAULT = os.environ.get("ELMINYAWE_BROWSER", "chromium").strip().lower() or "chromium"
+if BROWSER_DEFAULT not in ALLOWED_BROWSERS:
+    BROWSER_DEFAULT = "chromium"
+HEADLESS_DEFAULT = os.environ.get("ELMINYAWE_HEADLESS", "false").strip().lower() not in (
     "0", "false", "no", "off",
 )
 
@@ -492,7 +567,7 @@ def _solve_turnstile(url, sitekey, action=None, cdata=None, proxy=None,
     solver = TurnstileSolver(
         headless=headless,
         useragent=useragent,
-        browser_type=browser or "chromium",
+        browser_type=browser or BROWSER_DEFAULT,
         attempts=attempts,
     )
     return solver.solve(url=url, sitekey=sitekey, action=action,
@@ -549,6 +624,92 @@ def _siteverify(token, secret):
 
 
 # ------------------------------------------------------------------
+#  Connectivity diagnostics (smart failure hints + /diagnose)
+# ------------------------------------------------------------------
+#  Some Turnstile widgets route parts of their challenge through
+#  IPv6-only Cloudflare endpoints (e.g. brunhild.challenges.cloudflare.com
+#  has AAAA records and NO A records at all). On IPv4-only hosts those
+#  challenges can never complete. We probe both paths once and reuse the
+#  result to (a) explain failed solves with targeted hints and
+#  (b) power GET /diagnose.
+_IPV6_PROBE_HOST = "brunhild.challenges.cloudflare.com"
+_IPV4_PROBE_HOST = "challenges.cloudflare.com"
+_PROBE_CACHE = {"ts": 0.0, "v4": None, "v6": None}
+_PROBE_TTL = 300.0
+
+
+def _tcp_probe(host, family=None, timeout=3.0):
+    """TCP connect to host:443. Returns (ok, detail, elapsed_ms)."""
+    t0 = _now_ms()
+    try:
+        infos = socket.getaddrinfo(host, 443, family, socket.SOCK_STREAM)
+    except Exception as exc:
+        return False, f"dns: {type(exc).__name__}", _now_ms() - t0
+    last_err = None
+    for _fam, _typ, _proto, _cn, sa in infos[:4]:
+        sock = None
+        try:
+            sock = socket.socket(_fam, _typ, _proto)
+            sock.settimeout(timeout)
+            sock.connect(sa)
+            return True, f"connected to {sa[0]}", _now_ms() - t0
+        except Exception as exc:
+            last_err = exc
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+    return False, f"connect failed: {last_err}", _now_ms() - t0
+
+
+def _connectivity_probe():
+    """Cached (TTL) probe of the IPv4 and IPv6 paths to the challenge infra."""
+    now = time.time()
+    if _PROBE_CACHE["v4"] is None or now - _PROBE_CACHE["ts"] > _PROBE_TTL:
+        _PROBE_CACHE["v4"] = _tcp_probe(_IPV4_PROBE_HOST, socket.AF_INET)
+        _PROBE_CACHE["v6"] = _tcp_probe(_IPV6_PROBE_HOST, socket.AF_INET6)
+        _PROBE_CACHE["ts"] = now
+    return _PROBE_CACHE
+
+
+def _failure_hints():
+    """Targeted hints appended to failed solves (smart inspection)."""
+    hints = []
+    probe = _connectivity_probe()
+    v4_ok, v4_detail, _ = probe["v4"]
+    v6_ok, v6_detail, _ = probe["v6"]
+    if not v4_ok:
+        hints.append(
+            "This host cannot reach " + _IPV4_PROBE_HOST + " over IPv4 "
+            "(" + str(v4_detail) + "); Turnstile solving is impossible "
+            "from here. Check outbound firewall/egress rules."
+        )
+        return hints
+    if not v6_ok:
+        hints.append(
+            "This host has no usable IPv6 egress (" + str(v6_detail) + "). "
+            "Some Turnstile widgets route parts of their challenge through "
+            "IPv6-only Cloudflare endpoints (e.g. " + _IPV6_PROBE_HOST +
+            " has no IPv4 address at all), so those challenges cannot "
+            "complete here. Fixes: pass an IPv6-capable 'proxy' per "
+            "request, or enable Outbound IPv6 (Railway: Settings > "
+            "Networking > Enable Outbound IPv6, then redeploy), or deploy "
+            "on an IPv6-enabled host. Widgets that stay on dual-stack "
+            "endpoints keep working normally."
+        )
+    if not hints:
+        hints.append(
+            "Connectivity to the challenge infrastructure looks healthy, "
+            "so the failure is widget-side (the interactive challenge "
+            "rejected the browser fingerprint/IP risk): retry, raise "
+            "maxTimeout, or pass a cleaner 'proxy'."
+        )
+    return hints
+
+
+# ------------------------------------------------------------------
 #  Response builders (ELMINYAWE envelope, token first)
 # ------------------------------------------------------------------
 def _ok_body(url, sitekey, sitekey_source, token, widget, action, cdata,
@@ -570,7 +731,7 @@ def _ok_body(url, sitekey, sitekey_source, token, widget, action, cdata,
         "cdata": cdata,
         "proxy": proxy or None,
         "user_agent": useragent,
-        "browser_type": browser or "chromium",
+        "browser_type": browser or BROWSER_DEFAULT,
         "headless": bool(headless),
         "widget": widget or {},
         "timing": {
@@ -587,12 +748,27 @@ def _ok_body(url, sitekey, sitekey_source, token, widget, action, cdata,
             "'XXXX.DUMMY.TOKEN.XXXX', so this token proves the whole solving "
             "pipeline works. Dummy tokens are only accepted by Cloudflare TEST "
             "secret keys; real sitekeys produce production tokens that start "
-            "with '0.'"
+            "with '0.' or '1.'"
         )
-    elif not token.startswith("0."):
+    elif token.startswith("0."):
+        #  classic production token format - no note needed
+        result["token_type"] = "production_token"
+    elif token.startswith("1."):
+        #  newer Cloudflare-issued production format observed on some widgets;
+        #  the widget itself emits it into cf-turnstile-response after the
+        #  challenge passes, so it is a genuine Cloudflare token. Final
+        #  acceptance is proven server-side via siteverify (see /siteverify).
+        result["token_type"] = "production_token"
+        result["note"] = (
+            "Token prefix '1.' is a newer Cloudflare-issued production "
+            "format (emitted by the widget itself after the challenge "
+            "passed). Confirm server-side acceptance via /siteverify "
+            "with the site's secret key."
+        )
+    else:
         result["warning"] = (
             "token format looks unusual "
-            "(Turnstile tokens normally start with '0.')"
+            "(Turnstile tokens normally start with '0.' or '1.')"
         )
     return {
         "status": "ok",
@@ -697,7 +873,11 @@ def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
             except Exception:
                 attempts = None
 
-        effective_ua = useragent or DEFAULT_UA
+        #  v3.3.0 UA policy: only an explicit UA (param / ELMINYAWE_UA) is
+        #  forced; otherwise the engine uses the real browser UA (headed)
+        #  or a version-matched auto UA (headless). Never mix them.
+        explicit_ua = useragent or os.environ.get("ELMINYAWE_UA") or None
+        display_ua = explicit_ua or "auto (real browser UA)"
         headless = HEADLESS_DEFAULT if headless is None else bool(headless)
 
         if not _WORKERS.acquire(
@@ -709,11 +889,11 @@ def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
         try:
             log.info("solving: %s | sitekey=%s... | action=%s | proxy=%s | browser=%s",
                      url, (sitekey or "?")[:12], action or "-", bool(proxy),
-                     browser or "chromium")
+                     browser or BROWSER_DEFAULT)
             engine_result = _solve_turnstile(
                 url=url, sitekey=sitekey, action=action, cdata=cdata,
                 proxy=proxy, headless=headless,
-                useragent=useragent, attempts=attempts, browser=browser,
+                useragent=explicit_ua, attempts=attempts, browser=browser,
             )
         finally:
             _WORKERS.release()
@@ -730,7 +910,7 @@ def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
                             sitekey_source=sitekey_source, token=token,
                             widget=widget, action=action, cdata=cdata,
                             proxy=proxy, headless=headless,
-                            useragent=effective_ua, started=started,
+                            useragent=display_ua, started=started,
                             engine_result=engine_result,
                             siteverify=verify_block, browser=browser)
             return body, 200
@@ -744,7 +924,8 @@ def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
         message = engine_result.reason or "the engine returned an empty or invalid token"
         detail = (f"token={token!r}" if err_type == "InvalidToken" else message)
         return (_error_body(f"Could not solve the challenge: {message}",
-                            started, err_type, detail=detail), code)
+                            started, err_type, detail=detail,
+                            extra={"hints": _failure_hints()}), code)
 
     except Exception as exc:
         log.exception("unexpected error")
@@ -759,9 +940,14 @@ def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
 def _browser_info():
     cache = os.path.expanduser("~/.cache/ms-playwright")
     hits = sorted(glob.glob(os.path.join(cache, "chromium-*")))
-    if hits:
-        return True, os.path.basename(hits[-1])
-    return False, "chromium browser not found (patchright install missing)"
+    if not hits:
+        return False, "chromium browser not found (patchright install missing)"
+    detail = os.path.basename(hits[-1])
+    #  chrome channel (real Google Chrome, like the reference Docker recipe)
+    if (glob.glob(os.path.join(cache, "chrome-*"))
+            or os.path.exists("/opt/google/chrome/chrome")):
+        detail += " + chrome channel"
+    return True, detail
 
 
 _BROWSER_OK, _BROWSER_DETAIL = _browser_info()
@@ -779,6 +965,9 @@ def root():
         "endpoints": {
             "GET /": "service information (this page)",
             "GET /health": "health check",
+            "GET /diagnose": ("engine + connectivity diagnostics "
+                              "(/diagnose?selftest=true runs a live solve "
+                              "with a test sitekey)"),
             "GET /solve": ("quick solve: /solve?url=<page>&sitekey=<optional>"
                            "&action=<optional>&cdata=<optional>&proxy=<optional>"
                            "&secret=<optional siteverify>&browser=<optional>"),
@@ -808,6 +997,73 @@ def health():
         "max_concurrent": MAX_CONCURRENT,
         "version": VERSION,
     }
+
+
+@app.get("/diagnose")
+def diagnose(selftest: Optional[bool] = Query(False)):
+    """Engine + connectivity diagnostics (token first when selftest runs)."""
+    started = _now_ms()
+    probe = _connectivity_probe()
+    v4_ok, v4_detail, v4_ms = probe["v4"]
+    v6_ok, v6_detail, v6_ms = probe["v6"]
+
+    body = {
+        "status": "ok",
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "engine": {
+            "browser": _BROWSER_DETAIL,
+            "engine_ready": _BROWSER_OK,
+            "max_concurrent": MAX_CONCURRENT,
+        },
+        "connectivity": {
+            "challenges_api_ipv4": {
+                "reachable": v4_ok,
+                "detail": v4_detail,
+                "elapsed_ms": v4_ms,
+            },
+            "ipv6_challenge_egress": {
+                "available": v6_ok,
+                "probe_host": _IPV6_PROBE_HOST,
+                "detail": v6_detail,
+                "elapsed_ms": v6_ms,
+            },
+        },
+    }
+
+    verdict_parts = []
+    if _BROWSER_OK:
+        verdict_parts.append("engine ready (" + _BROWSER_DETAIL + ")")
+    else:
+        verdict_parts.append("engine browser missing")
+    if v4_ok and v6_ok:
+        verdict_parts.append("dual-stack egress: all widget types supported")
+    elif v4_ok:
+        verdict_parts.append(
+            "IPv4-only egress: widgets routed through IPv6-only challenge "
+            "endpoints need an IPv6 proxy or Outbound IPv6 enabled"
+        )
+    else:
+        verdict_parts.append("no path to the challenge infrastructure at all")
+    body["connectivity"]["verdict"] = ". ".join(verdict_parts) + "."
+
+    if selftest:
+        t0 = _now_ms()
+        res = _solve_turnstile(url="https://" + _IPV4_PROBE_HOST,
+                               sitekey="1x00000000000000000000AA",
+                               attempts=6, headless=HEADLESS_DEFAULT)
+        tok = (res.turnstile_value or "")
+        selftest_block = {
+            "token": tok or None,
+            "token_type": ("cloudflare_dummy_token"
+                           if tok == DUMMY_TOKEN else None),
+            "engine_status": res.status,
+            "reason": res.reason,
+            "elapsed_ms": _now_ms() - t0,
+        }
+        # token-first convention: the selftest block leads the response
+        body = {"selftest": selftest_block, **body}
+    return body
 
 
 @app.get("/solve")
@@ -945,7 +1201,7 @@ def _create_task(payload):
         "task": {
             "url": solve_kwargs["url"],
             "sitekey": solve_kwargs["sitekey"] or "auto_detect",
-            "browser": browser or "chromium",
+            "browser": browser or BROWSER_DEFAULT,
             "created_at": now,
         },
     }
@@ -1133,7 +1389,11 @@ RUN cat > /app/start_elminyawe.sh <<'SH'
 # ============================================================
 #  ELMINYAWE Solver - container entrypoint (embedded)
 #  Single process: the ELMINYAWE API. The engine runs inside
-#  it (one isolated Chromium per solve).
+#  it (one isolated browser per solve).
+#  v3.3.0: headed stealth mode by default - the browser runs
+#  on the built-in virtual display (Xvfb), exactly like the
+#  reference Docker recipe. Headless stays available via
+#  ELMINYAWE_HEADLESS=true.
 # ============================================================
 set -e
 cd /app
@@ -1143,14 +1403,19 @@ export PYTHONUNBUFFERED=1
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8191}"
 
-echo "[ELMINYAWE] Solver v3.2.0 - starting"
+echo "[ELMINYAWE] Solver v3.3.0 - starting"
 
-# optional headed (stealth) mode: serve the browser a virtual display
-if [ "${ELMINYAWE_HEADLESS:-true}" = "false" ] && [ -z "${DISPLAY:-}" ]; then
+#  headed stealth mode (default): serve the browser a virtual display
+if [ "${ELMINYAWE_HEADLESS:-false}" = "false" ] && [ -z "${DISPLAY:-}" ]; then
   if command -v Xvfb >/dev/null 2>&1; then
-    Xvfb :99 -screen 0 1280x720x24 >/dev/null 2>&1 &
+    Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp >/dev/null 2>&1 &
     export DISPLAY=:99
-    echo "[ELMINYAWE] virtual display ready on :99 (headless disabled)"
+    #  wait until the display socket is actually ready (up to ~5s)
+    for _ in $(seq 1 20); do
+      [ -S /tmp/.X11-unix/X99 ] && break
+      sleep 0.25
+    done
+    echo "[ELMINYAWE] virtual display ready on :99 (headed stealth mode)"
   else
     echo "[ELMINYAWE] WARNING: Xvfb not found, staying headless"
   fi
@@ -1166,8 +1431,10 @@ except Exception as exc:
     print(f"[ELMINYAWE] WARNING: engine driver import failed: {exc}")
 cache = os.path.expanduser("~/.cache/ms-playwright")
 hits = sorted(glob.glob(os.path.join(cache, "chromium-*")))
+chrome = bool(glob.glob(os.path.join(cache, "chrome-*"))) or os.path.exists("/opt/google/chrome/chrome")
 if hits:
-    print(f"[ELMINYAWE] browser: ready -> {os.path.basename(hits[-1])}")
+    detail = os.path.basename(hits[-1]) + (" + chrome channel" if chrome else "")
+    print(f"[ELMINYAWE] browser: ready -> {detail}")
 else:
     print("[ELMINYAWE] WARNING: chromium not found in patchright cache")
 PY
